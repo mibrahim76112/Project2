@@ -84,6 +84,7 @@ class SelfGating(nn.Module):
 
 
 class SelfGatedHierarchicalTransformerEncoder(nn.Module):
+ 
     """
     Self-Gated Hierarchical Transformer Encoder for time series classification.
 

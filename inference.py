@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import torch
+from sklearn.manifold import TSNE
 
 from data import load_sampled_data
 from utils import print_classification_metrics
@@ -117,11 +118,10 @@ def make_fault_delta_bar_plots(
     os.makedirs("figures", exist_ok=True)
     model.eval()
 
-    # ---- baseline fault 0 ----
+    # baseline fault 0
     idx0 = (y_tensor == baseline_fault).nonzero(as_tuple=False).squeeze(-1)
     M0 = None
     if idx0.numel() == 0:
-     #   print(f"[WARN] No windows for baseline fault {baseline_fault}. Delta plots will be skipped.")
         return
     else:
         sel0 = idx0[: min(n_windows, idx0.numel())]
@@ -131,12 +131,10 @@ def make_fault_delta_bar_plots(
     F, _ = M0.shape
     sensor_names = [f"Var{i+1}" for i in range(F)]
 
-
     with torch.no_grad():
         for fid in fault_ids:
             idx = (y_tensor == fid).nonzero(as_tuple=False).squeeze(-1)
             if idx.numel() == 0:
-       #         print(f"[WARN] No test windows found for fault {fid}; skipping.")
                 continue
 
             sel = idx[: min(n_windows, idx.numel())]
@@ -144,7 +142,6 @@ def make_fault_delta_bar_plots(
 
             M = _compute_M_for_indices(model, X_tensor, sel, reduce=reduce)  # (F, S)
 
-         
             abs_png = f"figures/gating_top{k_top}_fault_{fid}.png"
             plot_topk_sensors(
                 M,
@@ -156,9 +153,8 @@ def make_fault_delta_bar_plots(
                 title_prefix="Top Sensors by Gate Weight",
             )
 
-            
             if M0 is not None and M0.shape == M.shape:
-                Md = M - M0  
+                Md = M - M0
 
                 mean_delta = Md.mean(axis=1)
                 idx_debug = np.argsort(-np.abs(mean_delta))[:k_top]
@@ -185,6 +181,9 @@ def make_fault_delta_bar_plots(
                 print(
                     f"[INFO] Baseline missing or shape mismatch; saved absolute top-k plot for fault {fid} only."
                 )
+
+
+# ---------------- MODEL BUILD / CHECKPOINT LOAD ----------------
 
 def build_model(
     input_dim: int,
@@ -227,6 +226,8 @@ def load_checkpoint(
     return model
 
 
+# ---------------- ACCURACY INFERENCE ----------------
+
 def run_inference_for_accuracy(
     model: torch.nn.Module,
     X_test: np.ndarray,
@@ -246,7 +247,7 @@ def run_inference_for_accuracy(
 
     with torch.no_grad():
         for i in range(0, len(X_test), batch_size):
-            batch_np = X_test[i : i + batch_size]
+            batch_np = X_test[i: i + batch_size]
             batch_tensor = torch.tensor(batch_np, dtype=torch.float32, device=device)
             out = model(batch_tensor)
             preds.append(out.argmax(dim=1).cpu())
@@ -272,12 +273,105 @@ def run_inference_for_accuracy(
 
     if len(acc_list) > 0:
         macro_acc = float(np.mean(acc_list))
-       # print(f"\n[INFO] Mean per-fault accuracy: {macro_acc:.2f}%")
+        # print(f"\n[INFO] Mean per-fault accuracy: {macro_acc:.2f}%")
 
+
+# ---------------- T-SNE EMBEDDING PLOT ----------------
+
+@torch.no_grad()
+def compute_sght_embeddings(model, X: np.ndarray, device: torch.device, batch_size: int = 256) -> np.ndarray:
+    """
+    Compute embeddings from SelfGatedHierarchicalTransformerEncoder by
+    reproducing the forward path up to encoder_high and mean pooling over segments.
+
+    Returns:
+        embeddings: (N, d_model) numpy array.
+    """
+    model.eval()
+    all_emb = []
+
+    for i in range(0, len(X), batch_size):
+        batch_np = X[i: i + batch_size]
+        batch = torch.tensor(batch_np, dtype=torch.float32, device=device)
+
+        # Same internal path as forward, but stopping before classifier
+        z = model.input_proj(batch)                         # (B, T, d_model)
+        z = model.pos_encoder(z)                            # (B, T, d_model)
+        low_out = model.encoder_low(z)                      # (B, T, d_model)
+        pooled = model.pool(low_out.transpose(1, 2)).transpose(1, 2)  # (B, S, d_model)
+        gated = model.self_gate(pooled)                     # (B, S, d_model)
+        high_out = model.encoder_high(gated)                # (B, S, d_model)
+        emb = high_out.mean(dim=1)                          # (B, d_model)
+
+        all_emb.append(emb.cpu().numpy())
+
+    embeddings = np.vstack(all_emb)
+    return embeddings
+
+
+def tsne_plot_sght(
+    model: torch.nn.Module,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    device: torch.device,
+    save_path: str = "figures/tsne_sght_test.png",
+    sample_per_class: int = 800,
+    seed: int = 0,
+):
+    """
+    Compute SGHT embeddings for the test set, run t-SNE and save a 2D scatter
+    colored by fault class, similar to the reference embedding plot.
+    """
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+
+    rng = np.random.default_rng(seed)
+    y_test_int = y_test.astype(int)
+    classes = np.unique(y_test_int)
+
+    # Subsample per class to keep t-SNE tractable and balanced
+    idx_sel = []
+    for c in classes:
+        idx_c = np.where(y_test_int == c)[0]
+        if len(idx_c) > sample_per_class:
+            idx_c = rng.choice(idx_c, size=sample_per_class, replace=False)
+        idx_sel.append(idx_c)
+    idx_sel = np.concatenate(idx_sel, axis=0)
+
+    X_sel = X_test[idx_sel]
+    Y_sel = y_test_int[idx_sel]
+
+    print(f"[INFO] Computing embeddings for t-SNE on {len(X_sel)} samples")
+    feats = compute_sght_embeddings(model, X_sel, device=device, batch_size=256)
+
+    print("[INFO] Running t-SNE")
+    tsne = TSNE(
+        n_components=2,
+        learning_rate="auto",
+        init="random",
+        perplexity=35,
+        random_state=seed,
+    )
+    Z = tsne.fit_transform(feats)
+
+    print("[INFO] Plotting t-SNE embedding")
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sc = ax.scatter(Z[:, 0], Z[:, 1], c=Y_sel, s=6, cmap="tab20")
+    cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, ticks=classes)
+    cbar.set_label("Fault class")
+    ax.set_title("t-SNE embedding of SGHT features")
+    ax.set_xlabel("t-SNE 1")
+    ax.set_ylabel("t-SNE 2")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"[INFO] Saved t-SNE plot to: {save_path}")
+
+
+# ---------------- ARGPARSE AND MAIN ----------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Inference (accuracy + gating Δ bar plots) for Self-Gated Hierarchical Transformer on TEP."
+        description="Inference (accuracy + gating Δ bar plots + t-SNE) for Self-Gated Hierarchical Transformer on TEP."
     )
     parser.add_argument(
         "--ckpt",
@@ -300,7 +394,7 @@ def parse_args():
     parser.add_argument(
         "--no_plots",
         action="store_true",
-        help="If set, skip generating gating Δ bar plots.",
+        help="If set, skip generating gating Δ bar plots and t-SNE.",
     )
     return parser.parse_args()
 
@@ -315,7 +409,7 @@ def main():
         device = torch.device("cpu")
         print(f"[INFO] Using device: {device} (CUDA disabled for inference)")
 
-    # -------- 1) Accuracy: use TEST set from TESTING RData files --------
+    # Testing RData: used for accuracy and t-SNE
     X_train_tmp, X_test_metrics, y_train_tmp, y_test_metrics = load_sampled_data(
         window_size=args.window_size,
         stride=args.stride,
@@ -324,11 +418,11 @@ def main():
         faulty_path="/workspace/TEP_Faulty_Testing.RData",
         train_end=10000,
         test_start=10000,
-        test_end=16000,
+        test_end=15000,
         train_run_start=5,
         train_run_end=20,
         test_run_start=1,
-        test_run_end=50,
+        test_run_end=80,
     )
 
     print("Test (Testing file) Data Shape:", X_test_metrics.shape, y_test_metrics.shape)
@@ -351,7 +445,7 @@ def main():
     )
     model = load_checkpoint(model, args.ckpt, device)
 
-    # -- Accuracy from Testing RData test set --
+    # Accuracy on Testing RData
     run_inference_for_accuracy(
         model=model,
         X_test=X_test_metrics,
@@ -360,11 +454,24 @@ def main():
         batch_size=512,
     )
 
+    # t-SNE embedding on Testing RData
+    if not args.no_plots:
+        tsne_plot_sght(
+            model=model,
+            X_test=X_test_metrics,
+            y_test=y_test_metrics,
+            device=device,
+            save_path="figures/tsne_sght_test.png",
+            sample_per_class=800,
+            seed=0,
+        )
+
     if args.no_plots:
         return
 
-    print("\n[INFO] Plot code running")
-    
+    print("\n[INFO] Plot code running for gating plots")
+
+    # For gating plots, you use windows sampled from training file
     X_train_trainfile, X_test_plots, y_train_trainfile, y_test_plots = load_sampled_data(
         window_size=args.window_size,
         stride=args.stride,
@@ -390,7 +497,7 @@ def main():
         model=model,
         X_tensor=X_test_tensor_plots,
         y_tensor=y_test_tensor_plots,
-        fault_ids=[3, 9, 15], 
+        fault_ids=[3, 9, 15],
         baseline_fault=0,
         k_top=10,
         n_windows=512,

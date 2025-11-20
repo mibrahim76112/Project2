@@ -3,7 +3,7 @@ import pyreadr
 import numpy as np
 import pandas as pd
 
-# Optional GPU support (RAPIDS/cuML). If anything fails, fall back to CPU.
+
 try:
     import cupy as cp
     from cuml.preprocessing import StandardScaler as cuStandardScaler
@@ -143,7 +143,7 @@ def sample_train_and_test(
             fr = []
             b = train_ts[train_ts["faultNumber"] == i]
             for x in range(test_run_start, test_run_end):
-                b_x = b[b["simulationRun"] == x].iloc[140:660]
+                b_x = b[b["simulationRun"] == x].iloc[135:660]
                 fr.append(b_x)
             frames_test.append(pd.concat(fr))
 
