@@ -1,8 +1,9 @@
+# data.py
+
 import os
 import pyreadr
 import numpy as np
 import pandas as pd
-
 
 try:
     import cupy as cp
@@ -10,47 +11,35 @@ try:
     GPU_AVAILABLE = True
 except Exception as e:
     print(f"[WARN] GPU / RAPIDS scaler not available ({e}); using CPU StandardScaler.")
-    cp = np  # Fallback to NumPy
+    cp = np
     GPU_AVAILABLE = False
 
 from sklearn.preprocessing import StandardScaler as skStandardScaler
 
 
+def _guess_rdata_key(path: str) -> str:
+    """Choose the correct key based on file name."""
+    base = os.path.basename(path)
+    if "Training" in base:
+        return "fault_free_training" if "FaultFree" in base else "faulty_training"
+    if "Testing" in base:
+        return "fault_free_testing" if "FaultFree" in base else "faulty_testing"
+    raise ValueError(f"Cannot determine dataset key from file name: {path}")
+
+
 def read_training_data(
-    fault_free_path: str = "/workspace/TEP_FaultFree_Training.RData",
-    faulty_path: str = "/workspace/TEP_Faulty_Training.RData",
+    fault_free_path: str,
+    faulty_path: str,
 ):
     """
-    Reads the Tennessee Eastman Process (TEP) training or testing data from RData files.
-
-    The function automatically chooses the correct key ('fault_free_training',
-    'fault_free_testing', 'faulty_training', or 'faulty_testing') based on the filename.
-
-    Args:
-        fault_free_path (str): Path to the fault-free RData file.
-        faulty_path (str): Path to the faulty RData file.
-
-    Returns:
-        pd.DataFrame: Concatenated and sorted DataFrame of fault-free and faulty data.
+    Read TEP fault free and faulty data and return one concatenated DataFrame
+    sorted by faultNumber and simulationRun.
     """
-    # --- Load RData files ---
     b1_r = pyreadr.read_r(fault_free_path)
     b2_r = pyreadr.read_r(faulty_path)
 
-    
-    if "Training" in os.path.basename(fault_free_path):
-        key_free = "fault_free_training"
-    elif "Testing" in os.path.basename(fault_free_path):
-        key_free = "fault_free_testing"
-    else:
-        raise ValueError(f"Cannot determine dataset key from file name: {fault_free_path}")
-
-    if "Training" in os.path.basename(faulty_path):
-        key_faulty = "faulty_training"
-    elif "Testing" in os.path.basename(faulty_path):
-        key_faulty = "faulty_testing"
-    else:
-        raise ValueError(f"Cannot determine dataset key from file name: {faulty_path}")
+    key_free = _guess_rdata_key(fault_free_path)
+    key_faulty = _guess_rdata_key(faulty_path)
 
     if key_free not in b1_r:
         raise KeyError(f"Key '{key_free}' not found in {fault_free_path}")
@@ -62,6 +51,7 @@ def read_training_data(
 
     train_ts = pd.concat([b1, b2])
     return train_ts.sort_values(by=["faultNumber", "simulationRun"])
+
 
 def sample_train_and_test(
     train_ts: pd.DataFrame,
@@ -75,27 +65,12 @@ def sample_train_and_test(
     test_run_end: int | None = None,
 ):
     """
-    Samples training and test data based on model type (supervised or unsupervised),
-    with configurable slicing for fault 0 and simulation run ranges.
-
-    Args:
-        train_ts (pd.DataFrame): The full dataset.
-        type_model (str): "supervised" or "unsupervised".
-        train_end (int or None): Row index (exclusive) for fault 0 training subset.
-        test_start (int or None): Start row index for fault 0 test subset.
-        test_end (int or None): End row index (exclusive) for fault 0 test subset.
-        test_run_start (int or None): Start of simulationRun range for faulty test data.
-        test_run_end (int or None): End (exclusive) of simulationRun range for faulty test data.
-        train_run_start (int or None): Start of simulationRun range for faulty training data.
-        train_run_end (int or None): End (exclusive) of simulationRun range for faulty training data.
-
-    Returns:
-        tuple: (sampled_train, sampled_test) as pandas DataFrames.
+    Sample training and test data based on model type and slicing options.
     """
     sampled_train, sampled_test = pd.DataFrame(), pd.DataFrame()
     fault_0_data = train_ts[train_ts["faultNumber"] == 0]
 
-    # Defaults to keep your current behavior if not provided
+    # default slices if not given
     if train_end is None:
         train_end = 248000
     if train_run_start is None:
@@ -110,34 +85,34 @@ def sample_train_and_test(
         test_run_start = 200
     if test_run_end is None:
         test_run_end = 220
-    
-    # -------- TRAIN --------
+
+    # train
     frames_train = []
     if type_model == "supervised":
         for i in sorted(train_ts["faultNumber"].unique()):
             if i == 0:
-                # configurable slice for fault 0 train
                 frames_train.append(
                     train_ts[train_ts["faultNumber"] == i].iloc[:train_end]
                 )
             else:
                 fr = []
                 b = train_ts[train_ts["faultNumber"] == i]
-                # NOW configurable training simulationRun range
                 for x in range(train_run_start, train_run_end):
                     b_x = b[b["simulationRun"] == x].iloc[20:500]
                     fr.append(b_x)
-                frames_train.append(pd.concat(fr))
+                if fr:
+                    frames_train.append(pd.concat(fr))
     elif type_model == "unsupervised":
         frames_train.append(fault_0_data)
+    else:
+        raise ValueError(f"Unknown type_model: {type_model}")
 
     sampled_train = pd.concat(frames_train)
 
-    # -------- TEST --------
+    # test
     frames_test = []
     for i in sorted(train_ts["faultNumber"].unique()):
         if i == 0:
-           
             frames_test.append(fault_0_data.iloc[test_start:test_end])
         else:
             fr = []
@@ -145,14 +120,15 @@ def sample_train_and_test(
             for x in range(test_run_start, test_run_end):
                 b_x = b[b["simulationRun"] == x].iloc[135:660]
                 fr.append(b_x)
-            frames_test.append(pd.concat(fr))
+            if fr:
+                frames_test.append(pd.concat(fr))
 
     sampled_test = pd.concat(frames_test)
     return sampled_train, sampled_test
 
 
 def scale_and_window(
-    X_df,
+    X_df: pd.DataFrame,
     scaler,
     use_gpu: bool = True,
     y_col: str = "faultNumber",
@@ -160,23 +136,14 @@ def scale_and_window(
     stride: int = 5,
 ):
     """
-    Applies scaling and sliding window segmentation to the dataset.
-
-    Args:
-        X_df (pd.DataFrame): Input time-series data with labels.
-        scaler: Fitted scaler (cuML or scikit-learn).
-        use_gpu (bool): Whether to use GPU-based transformations when available.
-        y_col (str): Column name containing the target/fault labels.
-        window_size (int): Size of each time window.
-        stride (int): Step size between consecutive windows.
+    Apply scaling and sliding window segmentation.
 
     Returns:
-        tuple: (X_win, y_win)
-            - X_win (np.ndarray): [num_windows, window_size, num_features]
-            - y_win (np.ndarray): [num_windows]
+        X_win: [num_windows, window_size, num_features]
+        y_win: [num_windows]
     """
     y = X_df[y_col].values
-    X = X_df.iloc[:, 3:].values  
+    X = X_df.iloc[:, 3:].values
 
     if use_gpu and GPU_AVAILABLE:
         X_scaled = scaler.transform(cp.asarray(X))
@@ -200,46 +167,20 @@ def scale_and_window(
         return X_win, y_win
 
 
-def load_sampled_data(
-    window_size: int = 20,
-    stride: int = 5,
-    type_model: str = "supervised",
-    use_gpu: bool = True,
-    fault_free_path: str = "/workspace/TEP_FaultFree_Training.RData",
-    faulty_path: str = "/workspace/TEP_Faulty_Testing.RData",
-    train_end: int | None = None,
-    test_start: int | None = None,
-    test_end: int | None = None,
-    test_run_start: int | None = None,
-    test_run_end: int | None = None,
-    train_run_start: int | None = None,
-    train_run_end: int | None = None,
-):
+def load_sampled_data_from_config(cfg: dict):
     """
-    Loads, scales, and windows the sampled training and test data.
+    Main entry point for training and inference.
 
-    Args:
-        window_size (int): Length of each sliding window.
-        stride (int): Step size for windowing.
-        type_model (str): "supervised" or "unsupervised".
-        use_gpu (bool): Whether to use GPU scaler (if available).
-        fault_free_path (str): Path to fault-free training RData.
-        faulty_path (str): Path to faulty training/testing RData.
-        train_end (int or None): Row index (exclusive) for fault 0 train subset.
-        test_start (int or None): Start row index for fault 0 test subset.
-        test_end (int or None): End row index (exclusive) for fault 0 test subset.
-        test_run_start (int or None): Start simulationRun for faulty test data.
-        test_run_end (int or None): End (exclusive) simulationRun for faulty test data.
-        train_run_start (int or None): Start simulationRun for faulty train data.
-        train_run_end (int or None): End (exclusive) simulationRun for faulty train data.
-
-    Returns:
-        tuple: (X_train, X_test, y_train, y_test)
-            - X_train: [N_train, window_size, num_features]
-            - X_test: [N_test, window_size, num_features]
-            - y_train: [N_train]
-            - y_test: [N_test]
+    Uses paths and slicing from config.yaml.
     """
+    ds_cfg = cfg["dataset"]
+    dw_cfg = cfg["data_windowing"]
+
+    fault_free_path = ds_cfg["fault_free_path"]
+    faulty_path = ds_cfg["faulty_path"]
+    type_model = ds_cfg.get("type_model", "supervised")
+    use_gpu_scaler = bool(ds_cfg.get("use_gpu_scaler", True))
+
     train_ts = read_training_data(
         fault_free_path=fault_free_path,
         faulty_path=faulty_path,
@@ -247,45 +188,45 @@ def load_sampled_data(
 
     sampled_train, sampled_test = sample_train_and_test(
         train_ts,
-        type_model,
-        train_end=train_end,
-        test_start=test_start,
-        test_end=test_end,
-        test_run_start=test_run_start,
-        test_run_end=test_run_end,
-        train_run_start=train_run_start,
-        train_run_end=train_run_end,
+        type_model=type_model,
+        train_end=dw_cfg.get("train_end"),
+        test_start=dw_cfg.get("test_start"),
+        test_end=dw_cfg.get("test_end"),
+        test_run_start=dw_cfg.get("test_run_start"),
+        test_run_end=dw_cfg.get("test_run_end"),
+        train_run_start=dw_cfg.get("train_run_start"),
+        train_run_end=dw_cfg.get("train_run_end"),
     )
 
     fault_free = sampled_train[sampled_train["faultNumber"] == 0].iloc[:, 3:].values
 
-    if use_gpu and GPU_AVAILABLE:
+    if use_gpu_scaler and GPU_AVAILABLE:
         scaler = cuStandardScaler()
         scaler.fit(cp.asarray(fault_free))
-        print(f"[INFO] Using GPU Scaler (cuML), fit on fault-free samples: {fault_free.shape[0]} rows")
+        print(f"[INFO] Using GPU Scaler (cuML), fit on fault free samples: {fault_free.shape[0]} rows")
     else:
         scaler = skStandardScaler()
         scaler.fit(fault_free)
-   #     print(f"[INFO] Using CPU Scaler (scikit-learn), fit on fault-free samples: {fault_free.shape[0]} rows")
+        print(f"[INFO] Using CPU Scaler, fit on fault free samples: {fault_free.shape[0]} rows")
 
     print("[INFO] Scaling and windowing training data...")
     X_train, y_train = scale_and_window(
         sampled_train,
         scaler,
-        use_gpu=use_gpu,
+        use_gpu=use_gpu_scaler,
         y_col="faultNumber",
-        window_size=window_size,
-        stride=stride,
+        window_size=dw_cfg["window_size"],
+        stride=dw_cfg["stride"],
     )
 
     print("[INFO] Scaling and windowing test data...")
     X_test, y_test = scale_and_window(
         sampled_test,
         scaler,
-        use_gpu=use_gpu,
+        use_gpu=use_gpu_scaler,
         y_col="faultNumber",
-        window_size=window_size,
-        stride=stride,
+        window_size=dw_cfg["window_size"],
+        stride=dw_cfg["stride"],
     )
 
     return X_train, X_test, y_train, y_test

@@ -1,0 +1,54 @@
+# config.yaml
+
+dataset:
+  # RData paths
+  fault_free_path: "/workspace/TEP_FaultFree_Training.RData"
+  faulty_path: "/workspace/TEP_Faulty_Training.RData"
+
+  # supervised or unsupervised (fault 0 only)
+  type_model: "supervised"
+
+  # use GPU scaler if available (cuML)
+  use_gpu_scaler: true
+
+data_windowing:
+  # sliding window
+  window_size: 100
+  stride: 5
+
+  # fault 0 slicing
+  train_end: 248000        # rows of fault 0 used for train
+  test_start: 248000       # fault 0 test start row
+  test_end: 250000         # fault 0 test end row (exclusive)
+
+  # simulationRun ranges
+  train_run_start: 1
+  train_run_end: 200
+  test_run_start: 200
+  test_run_end: 220
+
+training:
+  seed: 123
+  epochs: 50
+  batch_size: 128
+  eval_batch_size: 256
+  learning_rate: 0.0001
+  label_smoothing: 0.05
+  results_dir: "results"
+
+model:
+  num_classes: 21
+  d_model: 128
+  nhead: 4
+  num_layers_low: 2
+  num_layers_high: 2
+  dim_feedforward: 128
+  dropout: 0.05
+  pool_output_size: 10
+
+gating:
+  enabled: true
+  faults_to_plot: [3, 9, 15]
+  baseline_fault: 0
+  k_top: 10
+  n_windows: 512
